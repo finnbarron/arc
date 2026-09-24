@@ -48,7 +48,10 @@ def equity_series(log: Path, day: dt.date, max_points: int = 400) -> tuple[list,
     return rows, marks
 
 
-def trades(path: Path) -> tuple[list, list]:
+def trades(path: Path, labels: list | None = None) -> tuple[list, list]:
+    # the shadow label taken at the same decision says what the old fixed
+    # +40% / -20% / 3 min rule did with the very same entry
+    fixed = {(l.mint, round(l.ts, 2)): l for l in (labels or [])}
     buys, sells = {}, []
     if not path.exists():
         return [], []
@@ -58,7 +61,7 @@ def trades(path: Path) -> tuple[list, list]:
         row = json.loads(line)
         if row["kind"] == "buy":
             buys[row["mint"]] = row
-        else:
+        elif row["kind"] == "sell":
             b = buys.pop(row["mint"], {})
             sells.append({
                 "mint": row["mint"], "symbol": row["symbol"], "entry_ts": row["entry_ts"],
@@ -66,6 +69,10 @@ def trades(path: Path) -> tuple[list, list]:
                 "pnl": round(row["pnl_sol"], 4), "ret": round(row["ret"], 4),
                 "reason": row["reason"], "ev": row.get("ev"), "p_tp": b.get("p_tp"),
                 "p_sl": b.get("p_sl"), "rug": b.get("rug"),
+                "took_half": row.get("took_initials", False),
+                "checks": row.get("exit_checks", 0), "last_exit": row.get("last_exit") or None,
+                "fixed_rule_move": (lambda l: round(l.ret, 4) if l else None)(
+                    fixed.get((row["mint"], round(b.get("decided_ts", -1), 2)))),
             })
     open_ = [{"mint": b["mint"], "symbol": b.get("symbol", ""), "sol": b["sol"], "ts": b["ts"],
               "ev": b.get("ev"), "p_tp": b.get("p_tp"), "p_sl": b.get("p_sl")} for b in buys.values()]
@@ -113,10 +120,10 @@ def build(data_dir: str = "data") -> dict:
     status = json.loads((d / "status.json").read_text()) if (d / "status.json").exists() else {}
     day = dt.datetime.now(dt.timezone.utc).date()
     equity, marks = equity_series(d / "run.log", day)
-    closed, open_ = trades(d / "trades.jsonl")
     labels = []
     for f in glob.glob(str(d / "labels-jev-*.jsonl")):
         labels += [Label(**json.loads(l)) for l in Path(f).read_text().splitlines() if l.strip()]
+    closed, open_ = trades(d / "trades.jsonl", labels)
     return {
         "updated": dt.datetime.now(dt.timezone.utc).timestamp(),
         "starting_sol": 10.0,

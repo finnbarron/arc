@@ -50,6 +50,7 @@ class Engine:
         self.now = 0.0
         self._tasks: set[asyncio.Task] = set()
         self._inflight: set[str] = set()
+        self._exit_inflight: set[str] = set()
 
     # ------------------------------------------------------------- events
 
@@ -82,6 +83,7 @@ class Engine:
         for label in self.labeler.on_price(st.mint, ev.ts, price):
             self.cal.add(label)
         self.broker.check_exits(st.mint, ev.ts, price)
+        await self._maybe_exit_check(st, ev.ts)
         await self._maybe_evaluate(st, ev.ts)
 
     async def on_clock(self, now: float) -> None:
@@ -96,6 +98,7 @@ class Engine:
             st = self.tokens.get(mint)
             if st:
                 self.broker.check_exits(mint, now, st.curve.price)
+                await self._maybe_exit_check(st, now)
         for mint in list(self.labeler.pending):
             st = self.tokens.get(mint)
             if st:
@@ -170,6 +173,64 @@ class Engine:
             log.info("BUY %s %.3f SOL ev=%+.3f p_tp=%.2f p_sl=%.2f", st.symbol, v.size_sol, v.ev, v.p_tp, v.p_sl)
         finally:
             self._inflight.discard(st.mint)
+
+    # -------------------------------------------------------- Jev exits
+
+    async def _maybe_exit_check(self, st: TokenState, now: float) -> None:
+        """Ask Jev, about once a second per position, whether to keep holding."""
+        if self.cfg.exit_mode != "jev":
+            return
+        pos = self.broker.positions.get(st.mint)
+        if pos is None or pos.exiting or now < pos.entry_ts or st.mint in self._exit_inflight:
+            return
+        if now - pos.last_exit_check < self.cfg.exit_check_every_s:
+            return
+        pos.last_exit_check = now
+        self._exit_inflight.add(st.mint)
+        coro = self._exit_check(st, pos, now)
+        if self.live:
+            task = asyncio.create_task(coro)
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        else:
+            await coro
+
+    async def _exit_check(self, st: TokenState, pos, now: float) -> None:
+        try:
+            price = st.curve.price
+            r = price / pos.entry_price - 1.0
+            peak = pos.peak_price / pos.entry_price - 1.0
+            position = {
+                "return_pct": round(r * 100, 1),
+                "peak_return_pct": round(peak * 100, 1),
+                "drawdown_from_peak_pct": round((price / pos.peak_price - 1) * 100, 1),
+                "seconds_held": round(now - pos.entry_ts, 1),
+                "max_hold_seconds": self.cfg.position_max_hold_s,
+                "took_half_off_already": pos.took_initials,
+                "round_trip_cost_pct": 5.5,
+            }
+            j = await self.brain.judge_exit(
+                st.features(now), {"name": st.name, "symbol": st.symbol}, position,
+                st.exit_view(now, pos.entry_price, pos.entry_ts),
+            )
+            if j is None or self.broker.positions.get(st.mint) is not pos or pos.exiting:
+                return
+            pos.exit_checks += 1
+            pos.last_exit = {"t": round(now - pos.entry_ts, 1), "r": round(r, 4), "hold": round(j.p_hold, 3),
+                             "half": round(j.p_half, 3), "sell": round(j.p_sell, 3), "dump": round(j.dump_risk, 3)}
+            due = now + j.latency_s + self.cfg.exec_latency_s
+            if j.p_sell >= self.cfg.exit_sell_p:
+                self.broker.submit_sell(st.mint, due, "jev_sell")
+            elif j.dump_risk >= self.cfg.exit_dump_p:
+                self.broker.submit_sell(st.mint, due, "jev_dump_risk")
+            elif j.p_half >= max(j.p_hold, j.p_sell) and not pos.took_initials and r > 0.03:
+                self.broker.submit_sell(st.mint, due, "jev_take_half", fraction=0.5)
+            else:
+                return
+            log.info("EXIT %s r=%+.1f%% after %.0fs: hold %.2f half %.2f sell %.2f dump %.2f",
+                     st.symbol, r * 100, now - pos.entry_ts, j.p_hold, j.p_half, j.p_sell, j.dump_risk)
+        finally:
+            self._exit_inflight.discard(st.mint)
 
     # ------------------------------------------------------------ safety
 
@@ -253,7 +314,7 @@ class Engine:
         wins = sum(t.pnl_sol > 0 for t in closed)
         return {
             "equity_sol": round(eq, 4),
-            "pnl_sol": round(eq - self.cfg.starting_sol, 4),
+            "pnl_sol": round(eq - self.cfg.starting_sol, 4),  # since the account opened
             "balance_sol": round(self.broker.balance, 4),
             "open": len(self.broker.positions),
             "closed": len(closed),
@@ -264,6 +325,8 @@ class Engine:
             "tracked": len(self.tokens),
             "jev_evals": self.stats.evals,
             "jev_calls": self.brain.calls,
+            "jev_exit_calls": self.brain.exit_calls,
+            "exit_mode": self.cfg.exit_mode,
             "jev_errors": self.brain.errors,
             "jev_usd": round(self.brain.usd_spent, 5),
             "jev_p50_ms": round(sorted(self.brain.latencies)[len(self.brain.latencies) // 2] * 1000, 1) if self.brain.latencies else None,

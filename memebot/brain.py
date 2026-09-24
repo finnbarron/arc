@@ -32,6 +32,22 @@ from typing import Any, Protocol
 log = logging.getLogger(__name__)
 
 TP, SL, NEITHER = "take_profit_first", "stop_loss_first", "neither"
+HOLD, SELL_HALF, SELL_ALL = "hold", "sell_half", "sell_now"
+
+# What experienced pump.fun traders and the rug-pull literature agree on.
+# Jev sees this with every entry and exit judgment so its read of the tape
+# is grounded in how this market actually behaves.
+PLAYBOOK = [
+    "Most pump.fun tokens dump within their first hour; only about 1% ever graduate. Default to caution.",
+    "A round trip costs about 5.5% in fees and slippage, so a small wiggle is not a reason to trade.",
+    "Volume is king. When buy flow dries up or the trade rate slows after a run-up, the top is usually in.",
+    "Creator or insider selling, or large sells into strength, means get out immediately.",
+    "Creator holding over 5% of supply, or the top five wallets over 30%, is a rug warning.",
+    "Wallets that bought in the first seconds (snipers, bundles) dump into the first pump.",
+    "Healthy: a pullback that holds its low while buying volume returns. Unhealthy: lower highs with rising sells.",
+    "Take initials out: once a position doubles, sell half so the rest rides risk-free.",
+    "Prices move in seconds here. A winner that is fading fast should be sold before it becomes a loser.",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +133,7 @@ def describe(features: dict, meta: dict) -> dict:
     """The state Jev sees: numbers plus words it can reason over."""
     f = features
     return {
+        "market_rules": PLAYBOOK,
         "token": meta,
         "raw": f,
         "reading": {
@@ -133,10 +150,81 @@ def describe(features: dict, meta: dict) -> dict:
                 else "has sold some" if f["creator_sold_pct_of_initial"] > 0
                 else "has not sold"
             ),
+            "snipers_still_holding": _lvl(f.get("early_sniper_holding_pct", 0), [(3, "little"), (10, "some")], "a lot, expect them to dump"),
             "bot_signs": _lvl(f["dust_buy_share"], [(0.3, "few dust buys"), (0.6, "many dust buys")], "mostly dust buys, likely bots"),
             "curve": _lvl(f["curve_progress"], [(0.1, "barely started"), (0.4, "early"), (0.8, "midway")], "near graduation"),
         },
     }
+
+
+@dataclass(frozen=True, slots=True)
+class ExitJudgment:
+    p_hold: float
+    p_half: float
+    p_sell: float
+    dump_risk: float
+    upside: float  # 0..1
+    latency_s: float
+    input_tokens: int
+
+
+def build_exit_questions(cfg) -> dict[str, dict[str, Any]]:
+    return {
+        "action": {
+            "type": "choice",
+            "instructions": (
+                "We hold this pump.fun token (see position and live_tape). Prices move in "
+                "seconds. What should we do with the position right now to make the most "
+                "money? Apply market_rules. Selling costs about 3% of the position, so do "
+                "not sell on noise, but do not let a winner turn into a loser."
+            ),
+            "criteria": {
+                HOLD: "Momentum and buy flow still favour higher prices, or the dip is healthy and holding. Keep the whole position.",
+                SELL_HALF: "Up meaningfully but the move is maturing or getting risky. Lock in profit on half and let the rest ride.",
+                SELL_ALL: "The move is over or turning: buyers drying up, big or insider sells, lower highs, or a rug is starting. Exit everything now.",
+            },
+        },
+        "dump_risk": {
+            "type": "noul",
+            "instructions": "Is a sharp drop of 20% or more likely in the next 30 seconds?",
+            "criteria": {
+                "true": "Big sells, creator or sniper selling, fading buy flow, or price rolling over from a spike.",
+                "false": "Steady or rising buy flow and no signs of large holders exiting.",
+            },
+        },
+        "upside": {
+            "type": "score",
+            "instructions": "How much further can this token run from here in the next minute?",
+            "criteria": [
+                "None. The run is over or it is dumping.",
+                "A little. Momentum is fading.",
+                "Some. Buying is steady and the chart is healthy.",
+                "A lot. Accelerating buying, new wallets piling in, price breaking to new highs.",
+            ],
+        },
+    }
+
+
+def describe_exit(features: dict, meta: dict, position: dict, tape: dict) -> dict:
+    base = describe(features, meta)
+    base["position"] = position
+    base["live_tape"] = tape
+    return base
+
+
+def to_exit_judgment(payload: dict, latency: float) -> ExitJudgment:
+    a = payload["answers"]
+    probs = a["action"]["probabilities"]
+    total = sum(float(v) for v in probs.values()) or 1.0
+    return ExitJudgment(
+        p_hold=float(probs.get(HOLD, 0.0)) / total,
+        p_half=float(probs.get(SELL_HALF, 0.0)) / total,
+        p_sell=float(probs.get(SELL_ALL, 0.0)) / total,
+        dump_risk=float(a["dump_risk"]["noul"]),
+        upside=min(max(float(a["upside"]["score"]) / 3.0, 0.0), 1.0),
+        latency_s=latency,
+        input_tokens=int(payload.get("usage", {}).get("input_tokens") or 0),
+    )
 
 
 class JevBackend(Protocol):
@@ -180,6 +268,17 @@ class MockJev:
 
     async def ask(self, state: dict, questions: dict) -> dict:
         f = state["raw"]
+        if "action" in questions:
+            r = state["position"]["return_pct"] / 100
+            fade = f["net_flow_15s_sol"] < 0 or state["live_tape"]["big_sells_last_30s"] > 0
+            sell = 0.7 if (fade and r > 0.05) or r < -0.15 else 0.2
+            await asyncio.sleep(0)
+            return {"answers": {
+                "action": {"type": "choice", "choice": SELL_ALL if sell > 0.5 else HOLD, "confidence": 0.5,
+                           "probabilities": {HOLD: 1 - sell, SELL_HALF: 0.0, SELL_ALL: sell}},
+                "dump_risk": {"type": "noul", "noul": 0.6 if fade else 0.2},
+                "upside": {"type": "score", "score": 1.0, "confidence": 0.5, "legend": {}, "probabilities": {}},
+            }, "usage": {"input_tokens": 0}}
         z = (
             1.2 * math.tanh(f["net_flow_60s_sol"] / 3)
             + 0.8 * math.tanh(f["chg_30s"] * 4)
@@ -249,6 +348,8 @@ class Brain:
         self.backend = backend
         self.cache = cache or JevCache(None)
         self.questions = build_questions(cfg)
+        self.exit_questions = build_exit_questions(cfg)
+        self.exit_calls = 0
         self.sem = asyncio.Semaphore(cfg.jev_concurrency)
         self.calls = 0
         self.errors = 0
@@ -280,6 +381,23 @@ class Brain:
             self.cache.put(key, {"payload": payload, "latency_s": latency})
         self.latencies.append(latency)
         return to_judgment(payload, latency, self.backend.provider)
+
+    async def judge_exit(self, features: dict, meta: dict, position: dict, tape: dict) -> ExitJudgment | None:
+        state = describe_exit(features, meta, position, tape)
+        started = time.perf_counter()
+        try:
+            async with self.sem:
+                payload = await self.backend.ask(state, self.exit_questions)
+            j = to_exit_judgment(payload, time.perf_counter() - started)
+        except Exception as exc:
+            self.errors += 1
+            log.warning("jev exit call failed: %s", exc)
+            return None
+        self.calls += 1
+        self.exit_calls += 1
+        self.input_tokens += j.input_tokens
+        self.latencies.append(j.latency_s)
+        return j
 
 
 def to_judgment(payload: dict, latency: float, provider: str) -> Judgment:

@@ -31,6 +31,7 @@ class Order:
     due: float
     sol: float = 0.0  # for buys
     reason: str = ""
+    fraction: float = 1.0  # for sells: share of the position to sell
     meta: dict = field(default_factory=dict)
 
 
@@ -45,6 +46,12 @@ class Position:
     peak_price: float
     ev: float
     exiting: bool = False
+    partial_pending: bool = False
+    took_initials: bool = False
+    proceeds_sol: float = 0.0  # banked from partial sells
+    last_exit_check: float = -1e18
+    exit_checks: int = 0
+    last_exit: dict = field(default_factory=dict)  # Jev's latest exit read
 
 
 @dataclass
@@ -59,6 +66,9 @@ class ClosedTrade:
     ret: float
     reason: str
     ev: float
+    took_initials: bool = False
+    exit_checks: int = 0
+    last_exit: dict = field(default_factory=dict)
 
 
 class PaperBroker:
@@ -102,12 +112,17 @@ class PaperBroker:
         self.fees_paid += self.cfg.tx_cost_sol
         self.orders.append(Order(mint, "buy", due, sol=sol, meta=meta))
 
-    def submit_sell(self, mint: str, due: float, reason: str) -> None:
+    def submit_sell(self, mint: str, due: float, reason: str, fraction: float = 1.0) -> None:
         pos = self.positions.get(mint)
         if pos is None or pos.exiting:
             return
-        pos.exiting = True
-        self.orders.append(Order(mint, "sell", due, reason=reason))
+        if fraction < 1.0:
+            if pos.partial_pending or pos.took_initials:
+                return
+            pos.partial_pending = True
+        else:
+            pos.exiting = True
+        self.orders.append(Order(mint, "sell", due, reason=reason, fraction=fraction))
 
     def fill_due(self, mint: str, now: float, curve: Curve) -> Curve:
         """Fill every order for ``mint`` whose time has come, at ``curve``.
@@ -148,19 +163,30 @@ class PaperBroker:
         return after
 
     def _fill_sell(self, o: Order, now: float, curve: Curve) -> Curve:
-        pos = self.positions.pop(o.mint, None)
+        pos = self.positions.get(o.mint)
         if pos is None:
             return curve
-        sol, after = curve.sell(pos.tokens, self.cfg.fee_rate)
+        partial = o.fraction < 1.0 and not pos.exiting
+        qty = pos.tokens * (o.fraction if partial else 1.0)
+        sol, after = curve.sell(qty, self.cfg.fee_rate)
         self.fees_paid += sol / (1 - self.cfg.fee_rate) * self.cfg.fee_rate
         sol *= 1.0 - self.cfg.extra_slippage
         proceeds = max(sol - self.cfg.tx_cost_sol, 0.0)
         self.fees_paid += self.cfg.tx_cost_sol
         self.balance += proceeds
-        pnl = proceeds - pos.cost_sol
+        if partial:
+            pos.tokens -= qty
+            pos.proceeds_sol += proceeds
+            pos.took_initials = True
+            pos.partial_pending = False
+            self._log("partial", mint=pos.mint, symbol=pos.symbol, ts=now, sol=proceeds, reason=o.reason)
+            return after
+        self.positions.pop(o.mint, None)
+        total = proceeds + pos.proceeds_sol
+        pnl = total - pos.cost_sol
         trade = ClosedTrade(
-            pos.mint, pos.symbol, pos.entry_ts, now, pos.cost_sol, proceeds, pnl,
-            pnl / pos.cost_sol, o.reason, pos.ev,
+            pos.mint, pos.symbol, pos.entry_ts, now, pos.cost_sol, total, pnl,
+            pnl / pos.cost_sol, o.reason, pos.ev, pos.took_initials, pos.exit_checks, pos.last_exit,
         )
         self.closed.append(trade)
         self._log("sell", **asdict(trade))
@@ -175,6 +201,17 @@ class PaperBroker:
         pos.peak_price = max(pos.peak_price, price)
         r = price / pos.entry_price - 1.0
         peak_r = pos.peak_price / pos.entry_price - 1.0
+        due = now + self.cfg.exec_latency_s
+        if self.cfg.exit_mode == "jev":
+            # Jev makes the calls (see Engine._exit_check); only rails Jev
+            # cannot override live here
+            if r <= -self.cfg.hard_stop:
+                self.submit_sell(mint, due, "hard_stop")
+            elif now - pos.entry_ts >= self.cfg.position_max_hold_s:
+                self.submit_sell(mint, due, "max_hold")
+            elif r >= self.cfg.take_initials_at and not pos.took_initials:
+                self.submit_sell(mint, due, "take_initials_2x", fraction=0.5)
+            return
         reason = ""
         if r >= self.cfg.take_profit:
             reason = "take_profit"

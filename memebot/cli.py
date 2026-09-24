@@ -46,7 +46,23 @@ def build(cfg: Config, *, live: bool, persist: bool, feed=None) -> Engine:
     brain = Brain(cfg, backend, cache)
     cal = Calibrator(cfg, _labels_path(cfg, backend.provider) if persist else None)
     broker = PaperBroker(cfg, data / "trades.jsonl" if persist else None)
-    return Engine(cfg, brain, broker, cal, feed=feed, live=live)
+    engine = Engine(cfg, brain, broker, cal, feed=feed, live=live)
+    if persist:
+        # one continuous paper account across restarts
+        realised = _realised_pnl(data / "trades.jsonl")
+        broker.balance += realised
+        engine.peak_equity = broker.balance
+    return engine
+
+
+def _realised_pnl(path: Path) -> float:
+    if not path.exists():
+        return 0.0
+    total = 0.0
+    for line in path.read_text().splitlines():
+        if '"kind": "sell"' in line:
+            total += json.loads(line)["pnl_sol"]
+    return total
 
 
 def _print_status(engine: Engine) -> None:

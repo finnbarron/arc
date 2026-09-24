@@ -158,7 +158,7 @@ def test_to_judgment_normalises():
 
 
 def test_stop_fills_late_and_pays_the_gap():
-    c = cfg(exec_latency_s=1.0)
+    c = cfg(exec_latency_s=1.0, exit_mode="barrier")
     b = PaperBroker(c)
     curve = Curve(40.0, 30.0 * 1.073e9 / 40.0)
     b.submit_buy("M", 0.5, 0.0, {"symbol": "M"})
@@ -256,3 +256,89 @@ def test_reliably_wrong_model_counts_as_skill_and_calibrates_to_truth():
     assert cal.skill_ok()
     assert cal.calibrate(0.1, "p_tp", TP) > 0.8
     assert cal.calibrate(0.7, "p_tp", TP) < 0.2
+
+
+# ------------------------------------------------------------ Jev exits
+
+
+def _held(c, sol=0.5):
+    b = PaperBroker(c)
+    curve = Curve(40.0, 30.0 * 1.073e9 / 40.0)
+    b.submit_buy("M", sol, 0.0, {"symbol": "M"})
+    curve = b.fill_due("M", 0.0, curve)
+    return b, curve
+
+
+def test_partial_then_full_sell_accounts_every_lamport():
+    c = cfg(exec_latency_s=0.0)
+    b, curve = _held(c)
+    tokens = b.positions["M"].tokens
+    b.submit_sell("M", 1.0, "jev_take_half", fraction=0.5)
+    curve = b.fill_due("M", 1.0, curve)
+    pos = b.positions["M"]
+    assert pos.took_initials and pos.tokens == pytest.approx(tokens / 2)
+    b.submit_sell("M", 2.0, "jev_take_half", fraction=0.5)  # only once
+    assert not b.orders
+    b.submit_sell("M", 3.0, "jev_sell")
+    b.fill_due("M", 3.0, curve)
+    (t,) = b.closed
+    assert t.took_initials and t.reason == "jev_sell"
+    assert b.balance == pytest.approx(c.starting_sol + t.pnl_sol)
+
+
+def test_rails_in_jev_mode():
+    c = cfg(exec_latency_s=0.0)
+    b, curve = _held(c)
+    e = b.positions["M"].entry_price
+    b.check_exits("M", 5.0, e * 0.9)  # -10%: Jev's call, no rail fires
+    assert not b.orders
+    b.check_exits("M", 6.0, e * 2.05)  # doubled: take initials
+    assert b.orders[-1].fraction == 0.5 and b.orders[-1].reason == "take_initials_2x"
+    b.fill_due("M", 6.0, curve)
+    b.check_exits("M", 7.0, e * 0.6)  # -40%: hard stop
+    assert b.orders[-1].reason == "hard_stop" and b.orders[-1].fraction == 1.0
+
+
+class ScriptedJev:
+    """Holds until the position is up 10%, then says sell."""
+
+    provider = "scripted"
+
+    def __init__(self):
+        self.exit_states = []
+
+    async def ask(self, state, questions):
+        self.exit_states.append(state)
+        sell = 0.9 if state["position"]["return_pct"] >= 10 else 0.05
+        return {"answers": {
+            "action": {"type": "choice", "choice": "x", "confidence": 0.9,
+                       "probabilities": {"hold": 1 - sell, "sell_half": 0.0, "sell_now": sell}},
+            "dump_risk": {"type": "noul", "noul": 0.1},
+            "upside": {"type": "score", "score": 2.0, "confidence": 0.5, "legend": {}, "probabilities": {}},
+        }, "usage": {"input_tokens": 1000}}
+
+
+def test_engine_asks_jev_every_second_and_follows_its_sell():
+    c = cfg(exec_latency_s=0.0)
+    jev = ScriptedJev()
+    eng = Engine(c, Brain(c, jev), PaperBroker(c), Calibrator(c))
+    creator = "dev"
+    asyncio.run(eng.on_event(NewToken(0.0, "M", "Moon", "MOON", creator)))
+    st = eng.tokens["M"]
+    eng.broker.submit_buy("M", 0.3, 1.0, {"symbol": "MOON"})
+    v_sol, k = 30.0, 30.0 * 1.073e9
+    t = 1.0
+    async def feed():
+        nonlocal v_sol, t
+        for i in range(60):
+            t += 0.5
+            v_sol *= 1.002  # steady climb, ~+10% after ~12s
+            await eng.on_event(Trade(t, "M", f"w{i}", True, 0.1, 1.0, v_sol, k / v_sol))
+        await eng.on_clock(t + 5)
+    asyncio.run(feed())
+    assert len(jev.exit_states) >= 5  # roughly one check per second held
+    s = jev.exit_states[0]
+    assert s["market_rules"] and s["position"]["seconds_held"] >= 0
+    assert s["live_tape"]["price_path_pct_vs_entry"]
+    (tr,) = eng.broker.closed
+    assert tr.reason == "jev_sell" and tr.exit_checks >= 5

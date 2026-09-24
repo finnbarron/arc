@@ -60,6 +60,18 @@ class Config:
     trail_arm: float = 0.20  # profit needed before the trail arms
     max_hold_s: float = 180.0
 
+    # ------------------------------------------------------------ exits
+    # "jev": Jev is asked every exit_check_every_s whether to hold, take half
+    #        off, or sell, seeing the live price path and order flow.
+    # "barrier": fixed take_profit / stop_loss / max_hold race.
+    exit_mode: str = "jev"
+    exit_check_every_s: float = 1.0
+    exit_sell_p: float = 0.5  # sell everything when P(sell_now) reaches this
+    exit_dump_p: float = 0.75  # ...or when Jev's dump risk reaches this
+    hard_stop: float = 0.35  # catastrophic stop Jev cannot override
+    position_max_hold_s: float = 300.0
+    take_initials_at: float = 1.0  # at +100% sell half (the "2x rule")
+
     # ---------------------------------------------------------- execution sim
     fee_rate: float = 0.0125  # pump.fun curve fee (protocol + creator)
     tx_cost_sol: float = 0.0006  # base fee + priority fee + tip, per tx
