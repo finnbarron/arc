@@ -371,3 +371,40 @@ def test_never_buys_what_jev_would_sell_a_second_later():
 async def _run_events(eng, events):
     for ev in events:
         await eng.on_event(ev)
+
+
+# ------------------------------------------------------------ scanner
+
+
+def test_decode_pumpswap_buy_moves_reserves():
+    from memebot.feeds import AMM_BUY_DISC
+
+    body = (AMM_BUY_DISC + struct.pack("<q", 1)
+            + struct.pack("<QQQQ", 2_000_000_000, 0, 0, 0)  # base out 2000 tokens
+            + struct.pack("<QQ", 200_000_000_000_000, 80_000_000_000)  # pool 200M tokens / 80 SOL
+            + struct.pack("<Q", 1_000_000_000)  # 1 SOL in
+            + struct.pack("<QQQQQQ", 20, 0, 5, 0, 0, 0)
+            + _pk(7) + _pk(8) + _pk(9) * 4 + _pk(10) + struct.pack("<Q", 5))
+    ev = decode_pump_event(body, 1.0, "s")
+    assert isinstance(ev, Trade) and ev.venue == "amm" and ev.is_buy
+    assert ev.mint == b58encode(_pk(7)) and ev.creator == b58encode(_pk(10))
+    assert ev.v_sol == pytest.approx(81.0) and ev.v_tokens == pytest.approx(200_000_000 - 2000)
+    assert ev.fee_rate == pytest.approx(0.003)
+
+
+def test_scanner_picks_up_mid_life_token_and_triggers_on_spike():
+    c = cfg(max_evals_per_min=100)
+    eng = Engine(c, Brain(c, MockJev()), PaperBroker(c), Calibrator(c))
+    k, v = 60.0 * 5e7, 60.0
+    async def run():
+        nonlocal v
+        t = 1000.0
+        for i in range(40):  # a graduated pool nobody saw launch, quiet then spiking
+            t += 1.0
+            v *= 1.0 if i < 20 else 1.012
+            await eng.on_event(Trade(t, "POOL", f"w{i}", True, 0.5, 1.0, v, k / v, venue="amm", fee_rate=0.0125))
+    asyncio.run(run())
+    st = eng.tokens["POOL"]
+    assert not st.launch_seen and st.venue == "amm" and st.fee_rate == 0.0125
+    assert eng.stats.evals >= 1  # the spike earned a Jev look
+    assert st.features(st.last_ts)["venue"].startswith("PumpSwap")

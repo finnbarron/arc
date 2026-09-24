@@ -41,6 +41,8 @@ from .events import (
 log = logging.getLogger(__name__)
 
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"  # PumpSwap
+WSOL = "So11111111111111111111111111111111111111112"
 LAMPORTS = 1_000_000_000
 TOKEN_UNITS = 1_000_000  # pump.fun tokens have 6 decimals
 
@@ -179,6 +181,10 @@ def _disc(name: str) -> bytes:
 TRADE_DISC = _disc("TradeEvent")
 CREATE_DISC = _disc("CreateEvent")
 COMPLETE_DISC = _disc("CompleteEvent")
+# PumpSwap (pump_amm) events, discriminators from pump-fun/pump-public-docs idl/pump_amm.json
+AMM_BUY_DISC = bytes([103, 244, 82, 31, 44, 245, 119, 119])
+AMM_SELL_DISC = bytes([62, 47, 55, 10, 165, 3, 220, 42])
+AMM_CREATE_POOL_DISC = bytes([177, 49, 12, 210, 160, 118, 167, 116])
 
 _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -239,7 +245,33 @@ def decode_pump_event(data: bytes, now: float, signature: str = "") -> Event | N
             body.i64()  # on-chain timestamp, second resolution; we use receive time
             v_sol = body.u64() / LAMPORTS
             v_tokens = body.u64() / TOKEN_UNITS
-            return Trade(now, mint, user, is_buy, sol, tokens, v_sol, v_tokens, signature)
+            creator, fee = "", 0.0
+            if body.remaining() >= 8 + 8 + 32 + 8 + 8 + 32 + 8:
+                body.u64(), body.u64()  # real reserves
+                body.pubkey()  # fee recipient
+                fee_bps = body.u64()
+                body.u64()
+                creator = body.pubkey()
+                fee = (fee_bps + body.u64()) / 10_000
+            return Trade(now, mint, user, is_buy, sol, tokens, v_sol, v_tokens, signature,
+                         creator=creator, fee_rate=fee)
+        if disc in (AMM_BUY_DISC, AMM_SELL_DISC):
+            return _decode_amm_trade(disc == AMM_BUY_DISC, body, now, signature)
+        if disc == AMM_CREATE_POOL_DISC:
+            body.i64(), body.take(2)  # timestamp, index
+            body.pubkey()  # pool creator (the migration authority)
+            base_mint, quote_mint = body.pubkey(), body.pubkey()
+            base_dec, quote_dec = body.take(1)[0], body.take(1)[0]
+            if quote_mint != WSOL:
+                return None  # only SOL-quoted pools
+            body.u64(), body.u64()  # amounts in
+            base = body.u64() / 10**base_dec
+            quote = body.u64() / 10**quote_dec
+            body.u64(), body.u64(), body.u64(), body.take(1)
+            pool = body.pubkey()
+            body.pubkey(), body.pubkey(), body.pubkey()
+            coin_creator = body.pubkey()
+            return NewToken(now, pool, "", "", coin_creator, quote, base, venue="amm", base_mint=base_mint)
         if disc == CREATE_DISC:
             name, symbol, uri = body.string(), body.string(), body.string()
             mint = body.pubkey()
@@ -257,6 +289,39 @@ def decode_pump_event(data: bytes, now: float, signature: str = "") -> Event | N
     return None
 
 
+def _decode_amm_trade(is_buy: bool, body: "_Reader", now: float, signature: str) -> Trade | None:
+    """PumpSwap BuyEvent / SellEvent. The event names the pool, not the mint,
+    so pools are tracked by pool address. Reserves are read before the swap
+    and moved by the swap's own amounts."""
+    body.i64()  # timestamp
+    base_amt = body.u64()
+    body.u64()  # max_quote_in / min_quote_out
+    body.u64(), body.u64()  # user reserves
+    pool_base, pool_quote = body.u64(), body.u64()
+    quote_amt = body.u64()  # quote_amount_in / quote_amount_out
+    lp_bps = body.u64(); body.u64()
+    proto_bps = body.u64(); body.u64()
+    body.u64(), body.u64()
+    pool = body.pubkey()
+    user = body.pubkey()
+    body.pubkey(), body.pubkey(), body.pubkey(), body.pubkey()
+    coin_creator = body.pubkey()
+    creator_bps = body.u64()
+    # pump.fun tokens have 6 decimals and pools are quoted in wrapped SOL (9)
+    base, quote = pool_base / TOKEN_UNITS, pool_quote / LAMPORTS
+    tokens, sol = base_amt / TOKEN_UNITS, quote_amt / LAMPORTS
+    if base <= 0 or quote <= 0 or quote > 1e6:
+        return None  # not a SOL-quoted pump pool
+    if is_buy:
+        base, quote = base - tokens, quote + sol
+    else:
+        base, quote = base + tokens, quote - sol
+    if base <= 0 or quote <= 0:
+        return None
+    return Trade(now, pool, user, is_buy, sol, tokens, quote, base, signature,
+                 creator=coin_creator, venue="amm", fee_rate=(lp_bps + proto_bps + creator_bps) / 10_000)
+
+
 class RpcLogsFeed(Feed):
     """Firehose of every pump.fun event via ``logsSubscribe``.
 
@@ -264,27 +329,29 @@ class RpcLogsFeed(Feed):
     trade, and the engine drops what it does not track.
     """
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, programs: tuple[str, ...] = (PUMP_PROGRAM, PUMP_AMM_PROGRAM)) -> None:
         if not url:
             raise ValueError("set MEMEBOT_RPC_WS to a Solana websocket RPC url")
         self.url = url
+        self.programs = programs
 
     async def events(self) -> AsyncIterator[Event]:
         import websockets
 
-        sub = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "logsSubscribe",
-            "params": [{"mentions": [PUMP_PROGRAM]}, {"commitment": "processed"}],
-        }
+        subs = [
+            {"jsonrpc": "2.0", "id": i + 1, "method": "logsSubscribe",
+             "params": [{"mentions": [prog]}, {"commitment": "processed"}]}
+            for i, prog in enumerate(self.programs)
+        ]
+        seen: dict[str, None] = {}  # a tx touching both programs arrives twice
         backoff = 1.0
         while True:
             try:
                 async with websockets.connect(
                     self.url, ping_interval=20, max_size=2**24
                 ) as ws:
-                    await ws.send(json.dumps(sub))
+                    for sub in subs:
+                        await ws.send(json.dumps(sub))
                     backoff = 1.0
                     log.info("rpc logsSubscribe connected")
                     async for raw in ws:
@@ -294,7 +361,14 @@ class RpcLogsFeed(Feed):
                         )
                         if not value or value.get("err"):
                             continue  # failed txs moved nothing
-                        for event in events_from_logs(value.get("logs") or [], now, value.get("signature", "")):
+                        sig = value.get("signature", "")
+                        if sig in seen:
+                            continue
+                        seen[sig] = None
+                        if len(seen) > 20000:
+                            for old in list(seen)[:10000]:
+                                del seen[old]
+                        for event in events_from_logs(value.get("logs") or [], now, sig):
                             yield event
             except asyncio.CancelledError:
                 raise
@@ -348,7 +422,8 @@ def read_events(path: Path) -> list[Event]:
 
 def make_feed(cfg) -> Feed:
     if cfg.feed == "rpc":
-        return RpcLogsFeed(cfg.rpc_ws)
+        programs = (PUMP_PROGRAM, PUMP_AMM_PROGRAM) if cfg.scan_amm else (PUMP_PROGRAM,)
+        return RpcLogsFeed(cfg.rpc_ws, programs)
     if cfg.feed == "pumpportal":
         return PumpPortalFeed(cfg.pumpportal_ws)
     raise ValueError(f"unknown feed {cfg.feed!r}")

@@ -23,6 +23,8 @@ class NewToken:
     v_tokens: float = INITIAL_V_TOKENS
     initial_buy_tokens: float = 0.0
     uri: str = ""
+    venue: str = "curve"  # "curve" (pump.fun bonding curve) | "amm" (PumpSwap pool)
+    base_mint: str = ""  # for amm pools: the token's mint (``mint`` is the pool)
     kind: str = "new"
 
 
@@ -34,9 +36,12 @@ class Trade:
     is_buy: bool
     sol: float
     tokens: float
-    v_sol: float  # reserves *after* this trade
+    v_sol: float  # reserves *after* this trade (virtual on the curve, real in a pool)
     v_tokens: float
     signature: str = ""
+    creator: str = ""  # token creator when the event carries it
+    venue: str = "curve"
+    fee_rate: float = 0.0  # total fee on this venue when the event carries it
     kind: str = "trade"
 
 

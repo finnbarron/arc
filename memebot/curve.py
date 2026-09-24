@@ -51,13 +51,14 @@ class Curve:
         return gross * (1.0 - fee_rate), Curve(new_sol, new_tokens)
 
 
-def round_trip_cost(cfg, sol: float, curve: Curve) -> float:
+def round_trip_cost(cfg, sol: float, curve: Curve, fee_rate: float | None = None) -> float:
     """Fraction of ``sol`` lost to buying and immediately selling.
 
     This is the hurdle every trade must clear before it earns anything.
     """
-    tokens, after = curve.buy(sol, cfg.fee_rate)
-    back, _ = after.sell(tokens, cfg.fee_rate)
+    fee = cfg.fee_rate if fee_rate is None else fee_rate
+    tokens, after = curve.buy(sol, fee)
+    back, _ = after.sell(tokens, fee)
     back *= (1.0 - cfg.extra_slippage) ** 2
     back -= 2 * cfg.tx_cost_sol
     return 1.0 - back / sol

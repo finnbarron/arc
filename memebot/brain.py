@@ -47,6 +47,8 @@ PLAYBOOK = [
     "Healthy: a pullback that holds its low while buying volume returns. Unhealthy: lower highs with rising sells.",
     "Take initials out: once a position doubles, sell half so the rest rides risk-free.",
     "Prices move in seconds here. A winner that is fading fast should be sold before it becomes a loser.",
+    "A spike on a thin trickle of buys fades; a spike carried by many new wallets and rising volume has a better chance to extend.",
+    "Graduated tokens trade in a PumpSwap pool: deeper liquidity, fewer outright rugs, but spikes there are often bought by late buyers who become exit liquidity.",
 ]
 
 
@@ -137,7 +139,16 @@ def describe(features: dict, meta: dict) -> dict:
         "token": meta,
         "raw": f,
         "reading": {
-            "age": _lvl(f["age_s"], [(30, "brand new"), (90, "young"), (180, "a few minutes old")], "older"),
+            "age": (
+                _lvl(f["age_s"], [(30, "brand new"), (90, "young"), (180, "a few minutes old")], "older")
+                if f.get("launch_seen", True)
+                else f"launched before we started watching; tracked for {int(f['age_s'])}s"
+            ),
+            "venue": f.get("venue", "pump.fun bonding curve"),
+            "trigger": (
+                "fresh launch" if f.get("launch_seen", True) and f["age_s"] <= 240
+                else "price spike on volume"
+            ),
             "participation": _lvl(f["unique_buyers"], [(10, "very few buyers"), (25, "some buyers"), (60, "many buyers")], "crowded"),
             "net_flow_last_15s": _lvl(f["net_flow_15s_sol"], [(-1, "heavy selling"), (-0.1, "net selling"), (0.1, "flat"), (1.5, "net buying")], "heavy buying"),
             "net_flow_last_60s": _lvl(f["net_flow_60s_sol"], [(-2, "heavy selling"), (-0.2, "net selling"), (0.2, "flat"), (3, "net buying")], "heavy buying"),

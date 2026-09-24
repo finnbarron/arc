@@ -37,7 +37,21 @@ class Config:
     pumpportal_ws: str = "wss://pumpportal.fun/api/data"
     # the public endpoint works; a private one (Helius, Triton) is faster and steadier
     rpc_ws: str = "wss://api.mainnet-beta.solana.com"
-    max_tracked: int = 400  # tokens watched at once
+    max_tracked: int = 6000  # tokens watched at once
+    # track every token that trades, not only launches seen live
+    scan_all: bool = True
+    scan_amm: bool = True  # also graduated tokens trading on PumpSwap
+    idle_evict_s: float = 600.0  # forget tokens quiet for this long
+
+    # ------------------------------------------------------- spike scanner
+    # Any tracked token whose price jumps this much on real volume gets a
+    # Jev look, whatever its age or venue.
+    spike_pct: float = 0.15
+    spike_window_s: float = 30.0
+    spike_min_trades: int = 6
+    spike_min_buyers: int = 4
+    amm_min_liquidity_sol: float = 20.0  # thinner pools are not worth the risk
+    max_evals_per_min: int = 90  # caps Jev spend on entry looks
 
     # ------------------------------------------------------ candidate filter
     # Cheap code-side filters that run before a Jev call is spent.
@@ -68,6 +82,8 @@ class Config:
     exit_check_every_s: float = 1.0
     exit_sell_p: float = 0.5  # sell everything when P(sell_now) reaches this
     exit_dump_p: float = 0.75  # ...or when Jev's dump risk reaches this
+    exit_confirm: int = 2  # consecutive sell reads needed (Jev flips within a second)
+    exit_dump_now_p: float = 0.85  # dump risk this high exits on a single read
     hard_stop: float = 0.35  # catastrophic stop Jev cannot override
     position_max_hold_s: float = 300.0
     take_initials_at: float = 1.0  # at +100% sell half (the "2x rule")

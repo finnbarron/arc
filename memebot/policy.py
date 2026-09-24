@@ -20,7 +20,8 @@ class Verdict:
     reason: str
 
 
-def decide(cfg, j: Judgment, cal: Calibrator, curve: Curve, balance: float, trading_enabled: bool) -> Verdict:
+def decide(cfg, j: Judgment, cal: Calibrator, curve: Curve, balance: float, trading_enabled: bool,
+           fee_rate: float | None = None, liquidity_sol: float | None = None) -> Verdict:
     p_tp = cal.calibrate(j.p_tp, "p_tp", TP)
     p_sl = cal.calibrate(j.p_sl, "p_sl", SL)
     # the three outcomes are exhaustive; renormalise if calibration overshoots
@@ -37,10 +38,10 @@ def decide(cfg, j: Judgment, cal: Calibrator, curve: Curve, balance: float, trad
     size = 0.0
     if gross > 0 and second_moment > 0:
         size = cfg.kelly_fraction * gross / second_moment * balance
-    real_sol = max(curve.v_sol - INITIAL_V_SOL, 1.0)
+    real_sol = max(curve.v_sol - INITIAL_V_SOL if liquidity_sol is None else liquidity_sol, 1.0)
     size = min(size, cfg.max_position_sol, cfg.max_curve_share * max(real_sol, 10.0), balance * 0.5)
     probe = max(size, cfg.min_position_sol)
-    ev = gross - round_trip_cost(cfg, probe, curve)
+    ev = gross - round_trip_cost(cfg, probe, curve, fee_rate)
 
     def no(reason: str) -> Verdict:
         return Verdict(False, 0.0, ev, p_tp, p_sl, reason)

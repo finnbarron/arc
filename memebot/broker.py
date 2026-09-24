@@ -52,6 +52,7 @@ class Position:
     last_exit_check: float = -1e18
     exit_checks: int = 0
     last_exit: dict = field(default_factory=dict)  # Jev's latest exit read
+    sell_streak: int = 0  # consecutive Jev sell reads
 
 
 @dataclass
@@ -79,6 +80,7 @@ class PaperBroker:
         self.orders: list[Order] = []
         self.closed: list[ClosedTrade] = []
         self.fees_paid = 0.0
+        self.fee_of: dict[str, float] = {}  # per-token venue fee, set by the engine
         self._fh = None
         if log_path:
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,7 +100,7 @@ class PaperBroker:
         for p in self.positions.values():
             c = curves.get(p.mint)
             if c is not None:
-                sol, _ = c.sell(p.tokens, self.cfg.fee_rate)
+                sol, _ = c.sell(p.tokens, self._fee(p.mint))
                 eq += max(sol - self.cfg.tx_cost_sol, 0.0)
         return eq
 
@@ -142,10 +144,14 @@ class PaperBroker:
         self.orders = remaining
         return curve
 
+    def _fee(self, mint: str) -> float:
+        return self.fee_of.get(mint, self.cfg.fee_rate)
+
     def _fill_buy(self, o: Order, now: float, curve: Curve) -> Curve:
-        tokens, after = curve.buy(o.sol, self.cfg.fee_rate)
+        fee = self._fee(o.mint)
+        tokens, after = curve.buy(o.sol, fee)
         tokens *= 1.0 - self.cfg.extra_slippage
-        self.fees_paid += o.sol * self.cfg.fee_rate
+        self.fees_paid += o.sol * fee
         price = o.sol / tokens if tokens else 0.0
         self.positions[o.mint] = Position(
             mint=o.mint,
@@ -168,8 +174,9 @@ class PaperBroker:
             return curve
         partial = o.fraction < 1.0 and not pos.exiting
         qty = pos.tokens * (o.fraction if partial else 1.0)
-        sol, after = curve.sell(qty, self.cfg.fee_rate)
-        self.fees_paid += sol / (1 - self.cfg.fee_rate) * self.cfg.fee_rate
+        fee = self._fee(o.mint)
+        sol, after = curve.sell(qty, fee)
+        self.fees_paid += sol / (1 - fee) * fee
         sol *= 1.0 - self.cfg.extra_slippage
         proceeds = max(sol - self.cfg.tx_cost_sol, 0.0)
         self.fees_paid += self.cfg.tx_cost_sol

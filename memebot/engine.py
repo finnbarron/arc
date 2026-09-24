@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from collections import deque
 from collections import Counter
 from dataclasses import dataclass, field, replace
 
@@ -51,6 +52,10 @@ class Engine:
         self._tasks: set[asyncio.Task] = set()
         self._inflight: set[str] = set()
         self._exit_inflight: set[str] = set()
+        self._last_tick = -1e18
+        self._last_evict = -1e18
+        self._eval_times: deque = deque()  # entry evals in the last minute (spend cap)
+        self._pool_names: dict[str, tuple[str, str]] = {}  # curve mint -> (name, symbol)
 
     # ------------------------------------------------------------- events
 
@@ -59,15 +64,26 @@ class Engine:
         await self.on_clock(ev.ts)
         if isinstance(ev, NewToken):
             if ev.mint not in self.tokens:
-                self.tokens[ev.mint] = TokenState.from_event(ev)
+                st = TokenState.from_event(ev)
+                if ev.venue == "curve":
+                    self._pool_names[ev.mint] = (ev.name, ev.symbol)
+                elif ev.base_mint in self._pool_names:
+                    # a curve token we watched just graduated into this pool
+                    st.name, st.symbol = self._pool_names[ev.base_mint]
+                    st.launch_seen = False
+                self.tokens[ev.mint] = st
                 self.stats.tokens_seen += 1
                 if self.feed:
                     await self.feed.watch([ev.mint])
-                await self._evict(ev.ts)
             return
         st = self.tokens.get(ev.mint)
         if st is None:
-            return
+            if not (self.cfg.scan_all and isinstance(ev, Trade)):
+                return
+            if ev.venue == "amm" and not self.cfg.scan_amm:
+                return
+            st = self.tokens[ev.mint] = TokenState.from_trade(ev)
+            self.stats.tokens_seen += 1
         if isinstance(ev, Migration):
             st.migrated = True
             self._settle_token(st, ev.ts, "migrated")
@@ -90,6 +106,12 @@ class Engine:
         """Time passes even when a token stops trading: fill due orders,
         run time stops, and settle labels on quiet tokens."""
         self.now = max(self.now, now)
+        if now - self._last_tick < 0.2 and not any(o.due <= now for o in self.broker.orders):
+            return  # at hundreds of events a second, five sweeps a second is plenty
+        self._last_tick = now
+        if now - self._last_evict >= 15:
+            self._last_evict = now
+            await self._evict(now)
         for mint in {o.mint for o in self.broker.orders if o.due <= now}:
             st = self.tokens.get(mint)
             if st:
@@ -109,24 +131,42 @@ class Engine:
     # ------------------------------------------------------- evaluation
 
     def _candidate(self, st: TokenState, now: float) -> str:
-        age = now - st.created_ts
+        """Cheap code-side screen, run on every trade. Two ways in:
+        a fresh launch in its first minutes, or a price spike on real
+        volume in any tracked token (curve or PumpSwap, any age)."""
         if st.migrated:
             return "migrated"
-        if age < self.cfg.eval_min_age_s or age > self.cfg.eval_max_age_s:
-            return "age"
-        if st.evals >= self.cfg.max_evals_per_token:
-            return "eval_cap"
         if now - st.last_eval_ts < self.cfg.reeval_every_s:
             return "cooldown"
-        if len(st.trades) < self.cfg.eval_min_trades:
-            return "few_trades"
-        if len(st.buyers) < self.cfg.eval_min_unique_buyers:
-            return "few_buyers"
-        mcap = st.curve.price * 1e9
-        if not self.cfg.eval_min_mcap_sol <= mcap <= self.cfg.eval_max_mcap_sol:
-            return "mcap"
+        if st.evals >= self.cfg.max_evals_per_token:
+            if now - st.last_eval_ts < 600:
+                return "eval_cap"
+            st.evals = 0  # a token can earn a fresh look after ten quiet minutes
         if st.mint in self._inflight or self.broker.busy(st.mint):
             return "busy"
+        if st.venue == "curve":
+            mcap = st.curve.price * 1e9
+            if not self.cfg.eval_min_mcap_sol <= mcap <= self.cfg.eval_max_mcap_sol * 4:
+                return "mcap"
+        elif st.liquidity_sol < self.cfg.amm_min_liquidity_sol:
+            return "thin_pool"
+        age = now - st.created_ts
+        fresh = (
+            st.launch_seen
+            and self.cfg.eval_min_age_s <= age <= self.cfg.eval_max_age_s
+            and len(st.trades) >= self.cfg.eval_min_trades
+            and len(st.buyers) >= self.cfg.eval_min_unique_buyers
+        )
+        if not fresh:
+            rise, n, buyers = st.spike(now, self.cfg.spike_window_s)
+            if not (rise >= self.cfg.spike_pct and n >= self.cfg.spike_min_trades
+                    and buyers >= self.cfg.spike_min_buyers):
+                return "no_trigger"
+        # spend cap on entry looks
+        while self._eval_times and self._eval_times[0] < now - 60:
+            self._eval_times.popleft()
+        if len(self._eval_times) >= self.cfg.max_evals_per_min:
+            return "rate_cap"
         return ""
 
     async def _maybe_evaluate(self, st: TokenState, now: float) -> None:
@@ -134,6 +174,7 @@ class Engine:
             return
         st.evals += 1
         st.last_eval_ts = now
+        self._eval_times.append(now)
         self._inflight.add(st.mint)
         coro = self._evaluate(st, now)
         if self.live:
@@ -156,7 +197,8 @@ class Engine:
             enabled, why = self.trading_enabled(now)
             if self.broker.open_count >= self.cfg.max_open_positions:
                 enabled, why = False, "max positions"
-            v = decide(self.cfg, j, self.cal, st.curve, self.broker.balance, enabled)
+            v = decide(self.cfg, j, self.cal, st.curve, self.broker.balance, enabled,
+                       fee_rate=st.fee_rate, liquidity_sol=st.liquidity_sol)
             if not v.buy:
                 # "shadow mode" from the policy means every gate passed but
                 # trading is off, so record *why* it is off instead
@@ -176,6 +218,7 @@ class Engine:
                     return
                 j = replace(j, latency_s=j.latency_s + x.latency_s)
             due = now + j.latency_s + self.cfg.exec_latency_s
+            self.broker.fee_of[st.mint] = st.fee_rate
             self.broker.submit_buy(
                 st.mint, v.size_sol, due,
                 {"symbol": st.symbol, "ev": round(v.ev, 4), "p_tp": round(v.p_tp, 3),
@@ -235,10 +278,13 @@ class Engine:
             pos.last_exit = {"t": round(now - pos.entry_ts, 1), "r": round(r, 4), "hold": round(j.p_hold, 3),
                              "half": round(j.p_half, 3), "sell": round(j.p_sell, 3), "dump": round(j.dump_risk, 3)}
             due = now + j.latency_s + self.cfg.exec_latency_s
-            if j.p_sell >= self.cfg.exit_sell_p:
-                self.broker.submit_sell(st.mint, due, "jev_sell")
-            elif j.dump_risk >= self.cfg.exit_dump_p:
+            wants_out = j.p_sell >= self.cfg.exit_sell_p or j.dump_risk >= self.cfg.exit_dump_p
+            pos.sell_streak = pos.sell_streak + 1 if wants_out else 0
+            if j.dump_risk >= self.cfg.exit_dump_now_p:
                 self.broker.submit_sell(st.mint, due, "jev_dump_risk")
+            elif wants_out and pos.sell_streak >= self.cfg.exit_confirm:
+                # Jev's read flips within a second; act on a confirmed read
+                self.broker.submit_sell(st.mint, due, "jev_sell" if j.p_sell >= self.cfg.exit_sell_p else "jev_dump_risk")
             elif j.p_half >= max(j.p_hold, j.p_sell) and not pos.took_initials and r > 0.03:
                 self.broker.submit_sell(st.mint, due, "jev_take_half", fraction=0.5)
             else:
@@ -293,14 +339,13 @@ class Engine:
             st.curve = self.broker.fill_due(st.mint, now + 1e-9, st.curve)
 
     async def _evict(self, now: float) -> None:
-        horizon = self.cfg.eval_max_age_s + self.cfg.max_hold_s + 30
         idle = [
             st for st in self.tokens.values()
             if not self.broker.busy(st.mint)
             and not self.labeler.busy(st.mint)
             and st.mint not in self._inflight
         ]
-        drop = [st for st in idle if now - st.created_ts > horizon]
+        drop = [st for st in idle if now - st.last_ts > self.cfg.idle_evict_s]
         over = len(self.tokens) - len(drop) - self.cfg.max_tracked
         if over > 0:
             rest = sorted((st for st in idle if st not in drop), key=lambda s: s.last_ts)

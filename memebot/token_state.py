@@ -20,8 +20,12 @@ class TokenState:
     creator: str
     created_ts: float
     curve: Curve
-    trades: deque = field(default_factory=lambda: deque(maxlen=4000))
-    prices: deque = field(default_factory=lambda: deque(maxlen=4000))  # (ts, price)
+    trades: deque = field(default_factory=lambda: deque(maxlen=1500))
+    prices: deque = field(default_factory=lambda: deque(maxlen=1500))  # (ts, price)
+    window: deque = field(default_factory=deque)  # recent (ts, price, is_buy, trader) for spike checks
+    venue: str = "curve"
+    fee_rate: float = 0.0125
+    launch_seen: bool = True  # False when first seen mid-life
     balances: dict = field(default_factory=dict)  # wallet -> tokens held
     buyers: set = field(default_factory=set)
     sellers: set = field(default_factory=set)
@@ -36,6 +40,33 @@ class TokenState:
     last_eval_ts: float = -1e18
 
     @classmethod
+    def from_trade(cls, tr: Trade) -> "TokenState":
+        """Start tracking a token mid-life from its first trade we see."""
+        st = cls(
+            mint=tr.mint, name="", symbol=tr.mint[:6], creator=tr.creator,
+            created_ts=tr.ts, curve=Curve(tr.v_sol, tr.v_tokens), last_ts=tr.ts,
+            venue=tr.venue, fee_rate=tr.fee_rate or 0.0125, launch_seen=False,
+        )
+        st.ath = st.curve.price
+        return st
+
+    @property
+    def liquidity_sol(self) -> float:
+        """Real SOL backing the price: curve SOL above the virtual 30, or the pool's SOL side."""
+        return self.curve.v_sol - INITIAL_V_SOL if self.venue == "curve" else self.curve.v_sol
+
+    def spike(self, now: float, window_s: float) -> tuple[float, int, int]:
+        """Rise from the window's low to now, trades and distinct buyers in the window."""
+        w = self.window
+        while w and w[0][0] < now - window_s:
+            w.popleft()
+        if not w:
+            return 0.0, 0, 0
+        low = min(x[1] for x in w)
+        buyers = len({x[3] for x in w if x[2]})
+        return (self.curve.price / low - 1.0 if low > 0 else 0.0), len(w), buyers
+
+    @classmethod
     def from_event(cls, ev: NewToken) -> "TokenState":
         st = cls(
             mint=ev.mint,
@@ -46,6 +77,8 @@ class TokenState:
             curve=Curve(ev.v_sol, ev.v_tokens),
             creator_initial=ev.initial_buy_tokens,
             last_ts=ev.ts,
+            venue=ev.venue,
+            fee_rate=0.0125,
         )
         if ev.initial_buy_tokens:
             st.balances[ev.creator] = ev.initial_buy_tokens
@@ -58,6 +91,11 @@ class TokenState:
         self.trades.append(tr)
         price = self.curve.price
         self.prices.append((tr.ts, price))
+        self.window.append((tr.ts, price, tr.is_buy, tr.trader))
+        if tr.fee_rate:
+            self.fee_rate = tr.fee_rate
+        if tr.creator and not self.creator:
+            self.creator = tr.creator
         self.ath = max(self.ath, price)
         self.last_ts = tr.ts
         held = self.balances.get(tr.trader, 0.0)
@@ -132,7 +170,11 @@ class TokenState:
         rate_overall = len(trades) / age if age > 0 else 0.0
 
         return {
-            "age_s": round(age, 1),
+            "venue": "pump.fun bonding curve" if self.venue == "curve" else "PumpSwap pool (graduated)",
+            "launch_seen": self.launch_seen,
+            "age_s": round(age, 1),  # time since launch, or since first seen when launch_seen is false
+            "liquidity_sol": round(self.liquidity_sol, 2),
+            "fee_pct": round(self.fee_rate * 100, 2),
             "trades": len(trades),
             "buys": len(buys),
             "sells": len(sells),
