@@ -408,3 +408,24 @@ def test_scanner_picks_up_mid_life_token_and_triggers_on_spike():
     assert not st.launch_seen and st.venue == "amm" and st.fee_rate == 0.0125
     assert eng.stats.evals >= 1  # the spike earned a Jev look
     assert st.features(st.last_ts)["venue"].startswith("PumpSwap")
+
+
+def test_graduation_rule_fires_once_at_half_curve_with_filters():
+    c = cfg(strategy="graduation", grad_min_buyers=5, exit_mode="barrier", exec_latency_s=0.0)
+    eng = Engine(c, Brain(c, MockJev()), PaperBroker(c), Calibrator(c))
+    k = 30.0 * 1.073e9
+
+    async def run(mint, creator_sells):
+        await eng.on_event(NewToken(0.0, mint, "Grad", "GRAD", "dev", initial_buy_tokens=1e6))
+        v = 30.0
+        for i in range(60):
+            v += 1.0  # +1 SOL per buy: crosses 50% (72.5 SOL) around trade 43
+            trader = "dev" if (creator_sells and i == 5) else f"w{i}"
+            await eng.on_event(Trade(1.0 + i, mint, trader, not (creator_sells and i == 5), 1.0, 1e5, v, k / v))
+
+    asyncio.run(run("GOOD", False))
+    asyncio.run(run("DEVSOLD", True))
+    assert eng.stats.buys == 1  # once, and only for the token whose creator held
+    assert eng.stats.skipped["grad_creator_sold"] == 1
+    held = set(eng.broker.positions) | {o.mint for o in eng.broker.orders} | {t.mint for t in eng.broker.closed}
+    assert held == {"GOOD"}

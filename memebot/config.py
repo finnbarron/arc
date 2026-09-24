@@ -74,6 +74,18 @@ class Config:
     trail_arm: float = 0.20  # profit needed before the trail arms
     max_hold_s: float = 180.0
 
+    # ------------------------------------------------------------ strategy
+    # "jev": Jev's judgment decides entries (and exits, see exit_mode).
+    # "graduation": a fixed rule found in offline research and pre-registered
+    #   for a forward test: buy when a launch's bonding curve first crosses
+    #   grad_progress full, if it has grad_min_buyers distinct buyers and the
+    #   creator has not sold. Jev is still asked, in shadow, and its answers
+    #   are logged with each trade so its value can be measured afterwards.
+    strategy: str = "jev"
+    grad_progress: float = 0.5
+    grad_min_buyers: int = 20
+    grad_size_sol: float = 0.3
+
     # ------------------------------------------------------------ exits
     # "jev": Jev is asked every exit_check_every_s whether to hold, take half
     #        off, or sell, seeing the live price path and order flow.

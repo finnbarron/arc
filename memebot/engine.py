@@ -170,6 +170,9 @@ class Engine:
         return ""
 
     async def _maybe_evaluate(self, st: TokenState, now: float) -> None:
+        if self.cfg.strategy == "graduation":
+            await self._maybe_graduation_entry(st, now)
+            return
         if self._candidate(st, now):
             return
         st.evals += 1
@@ -226,6 +229,58 @@ class Engine:
             )
             self.stats.buys += 1
             log.info("BUY %s %.3f SOL ev=%+.3f p_tp=%.2f p_sl=%.2f", st.symbol, v.size_sol, v.ev, v.p_tp, v.p_sl)
+        finally:
+            self._inflight.discard(st.mint)
+
+    # ------------------------------------------------ graduation strategy
+
+    async def _maybe_graduation_entry(self, st: TokenState, now: float) -> None:
+        if st.venue != "curve" or not st.launch_seen or st.migrated or getattr(st, "grad_fired", False):
+            return
+        if st.liquidity_sol / 85.0 < self.cfg.grad_progress:
+            return
+        st.grad_fired = True  # the rule fires once per token, on the first cross
+        f = st.features(now)
+        if f["unique_buyers"] < self.cfg.grad_min_buyers:
+            self.stats.skipped["grad_few_buyers"] += 1
+            return
+        if f["creator_sold_pct_of_initial"] > 0:
+            self.stats.skipped["grad_creator_sold"] += 1
+            return
+        if now < self.paused_until:
+            self.stats.skipped["paused"] += 1
+            return
+        if self.broker.busy(st.mint) or self.broker.open_count >= self.cfg.max_open_positions:
+            self.stats.skipped["max positions"] += 1
+            return
+        self._inflight.add(st.mint)
+        coro = self._graduation_buy(st, now, f)
+        if self.live:
+            task = asyncio.create_task(coro)
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+        else:
+            await coro
+
+    async def _graduation_buy(self, st: TokenState, now: float, f: dict) -> None:
+        try:
+            # Jev in shadow: asked and logged, never acting, so its value can be measured
+            j = await self.brain.judge(f, {"name": st.name, "symbol": st.symbol})
+            shadow = {"jev_p_tp": round(j.p_tp, 3), "jev_p_sl": round(j.p_sl, 3), "jev_rug": round(j.rug_risk, 3)} if j else {}
+            if j:
+                self.stats.evals += 1
+                self.labeler.add(st.mint, now, j)
+            latency = j.latency_s if j else 0.3
+            self.broker.fee_of[st.mint] = st.fee_rate
+            self.broker.submit_buy(
+                st.mint, self.cfg.grad_size_sol, now + latency + self.cfg.exec_latency_s,
+                {"symbol": st.symbol, "ev": None, "p_tp": shadow.get("jev_p_tp"), "p_sl": shadow.get("jev_p_sl"),
+                 "rug": shadow.get("jev_rug"), "decided_ts": now, "strategy": "graduation",
+                 "buyers": f["unique_buyers"], "progress": round(st.liquidity_sol / 85.0, 3), **shadow},
+            )
+            self.stats.buys += 1
+            log.info("BUY %s %.3f SOL graduation play at %.0f%% curve, %d buyers (Jev shadow p_tp=%s)",
+                     st.symbol, self.cfg.grad_size_sol, 100 * st.liquidity_sol / 85.0, f["unique_buyers"], shadow.get("jev_p_tp"))
         finally:
             self._inflight.discard(st.mint)
 
