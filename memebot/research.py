@@ -172,12 +172,24 @@ def _state_at(path: list, t: float, start: int = 0) -> tuple[int, Curve | None]:
     return i, cur
 
 
+def _sell_curve(path: list, t: float, fallback: Curve) -> Curve:
+    """Curve to sell into at t: the last one with tokens left (a completed
+    curve exits at its final price, like the live broker on migration)."""
+    best = fallback
+    for ts, vs, vt in path:
+        if ts > t:
+            break
+        if vt > 1e6:
+            best = Curve(vs, vt)
+    return best
+
+
 def simulate(row: dict, path: list, r: Rule) -> tuple[float, float] | None:
     """Return (net return on capital, exit time) for one entry, or None."""
     t0 = row["ts"] + ENTRY_DELAY
     i, c = _state_at(path, t0)
-    if c is None:
-        return None
+    if c is None or c.price <= 0 or c.v_tokens < 1e6:
+        return None  # nothing left to buy: the curve is complete
     fee = row["fee"]
     cost = r.size + TX
     tokens, after = c.buy(r.size, fee)
@@ -194,12 +206,14 @@ def simulate(row: dict, path: list, r: Rule) -> tuple[float, float] | None:
         if t - t0 > r.hold_s:
             reason_t = t0 + r.hold_s
             break
+        if vt <= 0:
+            reason_t = t  # curve completed: the token migrated
+            break
         price = Curve(vs, vt).with_holding(held).price
         peak = max(peak, price)
         g = price / entry - 1
         if r.half_at and not took_half and g >= r.half_at:
-            _, cx = _state_at(path, t + EXIT_DELAY, i - 1)
-            cx = (cx or Curve(vs, vt)).with_holding(held)
+            cx = _sell_curve(path, t + EXIT_DELAY, c).with_holding(held)
             sol, _ = cx.sell(held / 2, fee)
             banked += sol * (1 - SLIP) - TX
             held /= 2
@@ -212,8 +226,7 @@ def simulate(row: dict, path: list, r: Rule) -> tuple[float, float] | None:
             break
     if reason_t is None:
         reason_t = path[-1][0] if path else t0
-    _, cx = _state_at(path, reason_t + EXIT_DELAY)
-    cx = (cx or c).with_holding(held)
+    cx = _sell_curve(path, reason_t + EXIT_DELAY, c).with_holding(held)
     sol, _ = cx.sell(held, fee)
     proceeds = banked + max(sol * (1 - SLIP) - TX, 0.0)
     return proceeds / cost - 1.0, reason_t + EXIT_DELAY
