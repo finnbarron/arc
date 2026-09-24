@@ -81,8 +81,11 @@ async def cmd_run(cfg: Config, record_only: bool = False) -> None:
 
     async def pump() -> None:
         n = 0
+        launched: set[str] = set()  # replay only needs tokens seen from launch
         async for ev in feed.events():
-            if rec:
+            if ev.kind == "new":
+                launched.add(ev.mint)
+            if rec and ev.mint in launched:
                 rec.write(ev)
             n += 1
             if engine:

@@ -94,7 +94,12 @@ class PumpPortalFeed(Feed):
                         )
                     log.info("pumpportal connected")
                     async for raw in ws:
-                        event = parse_pumpportal(json.loads(raw), time.time())
+                        msg = json.loads(raw)
+                        if "message" in msg or "errors" in msg:
+                            # e.g. trade streams refused without a funded API key
+                            log.warning("pumpportal: %s", msg.get("message") or msg.get("errors"))
+                            continue
+                        event = parse_pumpportal(msg, time.time())
                         if event is not None:
                             yield event
             except asyncio.CancelledError:

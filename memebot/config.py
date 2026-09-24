@@ -28,12 +28,15 @@ def load_dotenv(path: str | Path = ".env") -> None:
 @dataclass
 class Config:
     # ------------------------------------------------------------- data feed
-    # "pumpportal": free push websocket, no key, ~100-300ms behind chain.
-    # "rpc": logsSubscribe on your own Solana WS RPC at processed commitment,
-    #        decoding pump.fun events straight from program logs. Faster.
-    feed: str = "pumpportal"
+    # "rpc": logsSubscribe on a Solana WS RPC at processed commitment,
+    #        decoding pump.fun events straight from program logs. Fastest
+    #        option without a Geyser stream, and free on the public endpoint.
+    # "pumpportal": PumpPortal websocket. Per-token trade streams need a
+    #        PumpPortal API key funded with >= 0.02 SOL (append ?api-key=...).
+    feed: str = "rpc"
     pumpportal_ws: str = "wss://pumpportal.fun/api/data"
-    rpc_ws: str = ""  # e.g. wss://mainnet.helius-rpc.com/?api-key=...
+    # the public endpoint works; a private one (Helius, Triton) is faster and steadier
+    rpc_ws: str = "wss://api.mainnet-beta.solana.com"
     max_tracked: int = 400  # tokens watched at once
 
     # ------------------------------------------------------ candidate filter

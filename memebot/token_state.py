@@ -64,6 +64,9 @@ class TokenState:
             self.buyers.add(tr.trader)
             self.buy_count[tr.trader] = self.buy_count.get(tr.trader, 0) + 1
             self.balances[tr.trader] = held + tr.tokens
+            if tr.trader == self.creator:
+                # the RPC feed delivers the creator's launch buy as its own trade
+                self.creator_initial += tr.tokens
         else:
             self.sellers.add(tr.trader)
             self.balances[tr.trader] = max(held - tr.tokens, 0.0)

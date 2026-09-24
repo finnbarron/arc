@@ -49,12 +49,12 @@ feed (PumpPortal WS | raw RPC logs) ─► token state/features ─► filter �
 
 **Data, fastest first**
 - Your own Yellowstone/Geyser gRPC stream: fastest, paid, not implemented.
-- `--feed rpc`: `logsSubscribe` on a Solana WS RPC at `processed` commitment,
+- `--feed rpc` (default): `logsSubscribe` on a Solana WS RPC at `processed` commitment,
   decoding pump.fun's Anchor events from program logs ourselves. No middleman.
-  Set `MEMEBOT_RPC_WS=wss://mainnet.helius-rpc.com/?api-key=...` (or Triton,
-  QuickNode). The public endpoint rate-limits hard.
-- `--feed pumpportal` (default): PumpPortal's free websocket. One extra hop,
-  zero setup.
+  Defaults to the free public endpoint. For lower latency set `MEMEBOT_RPC_WS=wss://mainnet.helius-rpc.com/?api-key=...` (or Triton,
+  QuickNode).
+- `--feed pumpportal`: PumpPortal websocket. Per-token trade streams now need a
+  PumpPortal API key funded with at least 0.02 SOL (`MEMEBOT_PUMPPORTAL_WS=wss://pumpportal.fun/api/data?api-key=...`).
 
 **Jev** gets one `POST /v1/systemone` per evaluation through the official
 `typesafe-sdk`, with four typed questions answered in one parallel pass:
