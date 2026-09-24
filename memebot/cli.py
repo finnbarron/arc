@@ -280,7 +280,8 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    logging.getLogger("typesafe_sdk").setLevel(logging.WARNING)
+    for noisy in ("typesafe_sdk", "httpx2", "httpx", "websockets"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     cfg = Config.from_env(jev_provider=args.provider, feed=args.feed)
 
     if args.cmd == "run":
