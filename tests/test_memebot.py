@@ -342,3 +342,32 @@ def test_engine_asks_jev_every_second_and_follows_its_sell():
     assert s["live_tape"]["price_path_pct_vs_entry"]
     (tr,) = eng.broker.closed
     assert tr.reason == "jev_sell" and tr.exit_checks >= 5
+
+
+class AlwaysDumpOnExit(ScriptedJev):
+    """Loves every entry, but the moment it is asked about holding, says sell."""
+
+    async def ask(self, state, questions):
+        if "action" in questions:
+            return await super().ask({**state, "position": {**state["position"], "return_pct": 50}}, questions)
+        return {"answers": {
+            "outcome": {"type": "choice", "choice": TP, "confidence": 0.9,
+                        "probabilities": {TP: 0.8, SL: 0.1, NEITHER: 0.1}},
+            "rug_risk": {"type": "noul", "noul": 0.05},
+            "organic": {"type": "noul", "noul": 0.9},
+            "momentum": {"type": "score", "score": 3.0, "confidence": 0.9, "legend": {}, "probabilities": {}},
+        }, "usage": {"input_tokens": 0}}
+
+
+def test_never_buys_what_jev_would_sell_a_second_later():
+    c = cfg(calibration_warmup=0, require_edge=False, min_ev=-1.0)
+    eng = Engine(c, Brain(c, AlwaysDumpOnExit()), PaperBroker(c), Calibrator(c))
+    events = generate(40, seed=4)
+    asyncio.run(_run_events(eng, events))
+    assert eng.stats.buys == 0
+    assert eng.stats.skipped["jev_would_not_hold"] > 0
+
+
+async def _run_events(eng, events):
+    for ev in events:
+        await eng.on_event(ev)

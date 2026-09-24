@@ -12,7 +12,7 @@ import asyncio
 import logging
 import math
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .brain import Brain
 from .broker import PaperBroker
@@ -163,6 +163,18 @@ class Engine:
                 key = why if v.reason == "shadow mode" else v.reason.split(" ")[0]
                 self.stats.skipped[key] += 1
                 return
+            if self.cfg.exit_mode == "jev":
+                # Jev's hold/sell read must agree with its buy read. Live data
+                # showed entries it would sell one second later, which just
+                # pays the round-trip cost twice.
+                x = await self.brain.judge_exit(
+                    features, meta, self._position_view(0.0, 0.0, 0.0, False),
+                    st.exit_view(now, st.curve.price, now),
+                )
+                if x is None or x.p_hold <= max(x.p_sell, x.p_half) or x.dump_risk >= self.cfg.exit_dump_p:
+                    self.stats.skipped["jev_would_not_hold"] += 1
+                    return
+                j = replace(j, latency_s=j.latency_s + x.latency_s)
             due = now + j.latency_s + self.cfg.exec_latency_s
             self.broker.submit_buy(
                 st.mint, v.size_sol, due,
@@ -195,20 +207,24 @@ class Engine:
         else:
             await coro
 
+    def _position_view(self, r: float, peak: float, held: float, took_half: bool, drawdown: float = 0.0) -> dict:
+        return {
+            "return_pct": round(r * 100, 1),
+            "peak_return_pct": round(peak * 100, 1),
+            "drawdown_from_peak_pct": round(drawdown * 100, 1),
+            "seconds_held": round(held, 1),
+            "max_hold_seconds": self.cfg.position_max_hold_s,
+            "took_half_off_already": took_half,
+            "round_trip_cost_pct": 5.5,
+        }
+
     async def _exit_check(self, st: TokenState, pos, now: float) -> None:
         try:
             price = st.curve.price
             r = price / pos.entry_price - 1.0
             peak = pos.peak_price / pos.entry_price - 1.0
-            position = {
-                "return_pct": round(r * 100, 1),
-                "peak_return_pct": round(peak * 100, 1),
-                "drawdown_from_peak_pct": round((price / pos.peak_price - 1) * 100, 1),
-                "seconds_held": round(now - pos.entry_ts, 1),
-                "max_hold_seconds": self.cfg.position_max_hold_s,
-                "took_half_off_already": pos.took_initials,
-                "round_trip_cost_pct": 5.5,
-            }
+            position = self._position_view(r, peak, now - pos.entry_ts, pos.took_initials,
+                                           drawdown=price / pos.peak_price - 1)
             j = await self.brain.judge_exit(
                 st.features(now), {"name": st.name, "symbol": st.symbol}, position,
                 st.exit_view(now, pos.entry_price, pos.entry_ts),
