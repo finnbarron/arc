@@ -97,6 +97,9 @@ class Config:
     # No capital is risked until this many candidates have been labelled with
     # their real outcome, so Jev's probabilities can be checked against reality.
     calibration_warmup: int = 60
+    # False lets the bot trade even when Jev's entry calls show no measured
+    # edge. Only for experiments (e.g. testing exits); expect losses.
+    require_edge: bool = True
     calibration_bins: int = 10
     kill_window: int = 25  # recent trades checked by the kill switch
     kill_max_drawdown: float = 0.25  # of starting balance

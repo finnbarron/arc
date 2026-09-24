@@ -239,7 +239,7 @@ class Engine:
             return False, f"paused: {self.pause_reason}"
         if not self.cal.warmed_up:
             return False, "shadow mode"
-        if not self.cal.skill_ok():
+        if self.cfg.require_edge and not self.cal.skill_ok():
             return False, "no measured edge"
         return True, ""
 
