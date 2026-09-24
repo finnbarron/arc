@@ -77,7 +77,9 @@ class Config:
     # ------------------------------------------------------ edge requirement
     min_ev: float = 0.05  # net of all costs, per SOL risked
     max_rug_risk: float = 0.45
-    min_confidence: float = 0.35
+    # Jev is often confidently wrong on pump.fun (live data), so its
+    # self-reported confidence is not a useful gate. Calibration is.
+    min_confidence: float = 0.0
 
     # -------------------------------------------------- calibration / safety
     # No capital is risked until this many candidates have been labelled with

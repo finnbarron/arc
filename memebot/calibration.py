@@ -185,16 +185,28 @@ class Calibrator:
         return sum((getattr(l, attr) - (l.outcome == outcome)) ** 2 for l in self.labels) / self.n
 
     def skill_ok(self) -> bool:
-        """Jev must rank winners above losers, measurably, before we trade."""
+        """Jev's ranking must carry real information before we trade on it.
+
+        Direction does not matter: ``calibrate`` maps raw scores to observed
+        frequencies, so a model that is reliably *wrong* (live data showed
+        Jev chasing pumps that then dump) is as usable as one that is
+        reliably right. What matters is that the separation is significant,
+        on either the take-profit or the stop-loss question. The EV gate
+        still has to clear costs on top of this.
+        """
         if not self.warmed_up:
             return False
-        n_pos = sum(l.outcome == TP for l in self.labels)
-        if n_pos < 5:
-            return False
-        a = self.auc()
-        # standard error of AUC (Hanley & McNeil approximation, conservative)
-        se = math.sqrt(0.25 / min(n_pos, self.n - n_pos))
-        return a - se > 0.5 and a >= self.cfg.extra.get("min_auc", 0.55)
+        for attr, outcome in (("p_tp", TP), ("p_sl", SL)):
+            n_pos = sum(l.outcome == outcome for l in self.labels)
+            n_neg = self.n - n_pos
+            if min(n_pos, n_neg) < 5:
+                continue
+            a = self.auc(attr, outcome)
+            # standard error of AUC under the null (conservative)
+            se = math.sqrt(0.25 / min(n_pos, n_neg))
+            if abs(a - 0.5) > 2 * se and abs(a - 0.5) >= self.cfg.extra.get("min_auc_gap", 0.05):
+                return True
+        return False
 
     def summary(self) -> dict:
         return {

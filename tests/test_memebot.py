@@ -243,3 +243,16 @@ def test_kill_switch_pauses_after_a_losing_streak():
     asyncio.run(eng.on_clock(100.0))
     enabled, why = eng.trading_enabled(101.0)
     assert not enabled and why.startswith("paused")
+
+
+def test_reliably_wrong_model_counts_as_skill_and_calibrates_to_truth():
+    c = cfg(calibration_warmup=50)
+    cal = Calibrator(c)
+    for i in range(200):
+        hi = i % 2 == 0
+        # the model says "take profit" exactly when it is about to dump
+        cal.add(Label("m", i, 0.7 if hi else 0.1, 0.1 if hi else 0.7, 0.1,
+                      SL if hi else TP, -0.22 if hi else 0.45))
+    assert cal.skill_ok()
+    assert cal.calibrate(0.1, "p_tp", TP) > 0.8
+    assert cal.calibrate(0.7, "p_tp", TP) < 0.2
